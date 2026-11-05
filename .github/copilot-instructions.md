@@ -52,6 +52,8 @@ Read these before changing anything:
 - **Node names:** derive from SHA-256 hashes or values validated by regex. Never use raw input as a path segment.
 - **Queries:** use bound variables. Any value concatenated into a query must first pass a strict allow-list regex.
 - **Logging:** never log tokens or payloads. Log counts and IDs only.
+- **Repoinit:** use `set principal ACL for <service user>`. A plain `set ACL for` does not take effect on Cloud Service or the SDK.
+- **SDK version:** build against the SDK or uber-jar of the runtime you deploy to. A newer SDK can add package imports the target lacks, and the bundle then won't resolve.
 - **Asset nodes in `/content/dam`:** never write to them.
 - **Listeners stay lightweight:** they only enqueue Sling jobs, and the job consumer does the work.
 
@@ -66,13 +68,14 @@ aio aem rde install <module>/all/target/*-all-*.zip
 
 ## Status
 
-- **Not yet built:** the classes that use AEM APIs haven't been compiled against real dependencies. On the first build, expect small fixes to signatures or imports.
-- **Tested:** the pure-Java classes plus the two test classes compile, and their tests pass.
+- **Built and tested:** all three builds succeed and 18 unit tests pass (pure-Java classes only).
+- **Verified end to end** on an RDE (Assets) with a local SDK author (Sites) for UUID references: create, replace, stale re-push, author URL and `pageUrl`.
+- **Not tested yet:** publish and unpublish, page delete and move, vanity references, nightly reconcile.
 
 ## Backlog (in priority order)
 
-1. Build both projects against the uber-jar and the SDK, and fix any compile issues.
-2. Deploy to an RDE and run the end-to-end check from the README.
+1. Harden the push task: a permanent 4xx (400 or 413) is retried forever and blocks the pending queue. Bisect the batch and quarantine the single bad page.
+2. Test publish and unpublish, page delete and move, and vanity references end to end.
 3. Confirm the open questions in `docs/design-decisions.md` (asset ID vs `jcr:uuid`, the vanity URL format, the vanity metadata property, CSRF and referrer behaviour).
 4. When an XF changes, re-enqueue the pages that embed it.
 5. Add an Oak index for the vanity metadata property on Assets.
@@ -80,3 +83,4 @@ aio aem rde install <module>/all/target/*-all-*.zip
 7. Replace the bearer token with an IMS technical account (token exchange in `AssetsClient`).
 8. Add the results to the Assets References panel, and merge in the CDN/Databricks signal asynchronously.
 9. Add a CDN traffic filter rate limit on `/bin/dmrefs/ingest`.
+10. Housekeeping: prune empty acknowledged snapshots on Sites, tombstones on Assets, and rows for deleted assets; run reconcile in capped, resumable slices.

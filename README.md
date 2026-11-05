@@ -59,7 +59,7 @@ dm-asset-references/
 
 ```
 assets/<u0u1>/<u2u3>/<uuid>/<instanceId>/<sha256(pagePath)>
-    instanceId, pagePath, assetId, author, published, referencedAs[], updatedAt
+    instanceId, pagePath, assetId, author, published, referencedAs[], authorUrl (optional), updatedAt
 unresolved/<v0v1>/<sha256(vanity)>/<instanceId>/<sha256(pagePath)>
     instanceId, pagePath, vanity, author, published, updatedAt
 pages/<instanceId>/<p0p1>/<sha256(pagePath)>
@@ -85,6 +85,7 @@ pages/<instanceId>/<p0p1>/<sha256(pagePath)>
 |---|---|
 | `schemaVersion` | `1` |
 | `instanceId` | `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` (also used as a node name) |
+| `authorUrl` | Optional. Public https base URL of the sending author instance, e.g. `https://author.acme.com`. No credentials, query or fragment, at most 200 characters. An invalid value fails validation with `400`. |
 | `pages` | 1–200 per request, no duplicate `pagePath` |
 | `pagePath` | Under `/content`, at most 1024 characters, no `..`, no `[]\|*` or control characters |
 | `seq` | Positive long, increasing per page |
@@ -115,14 +116,18 @@ The body is capped at 1 MB. The whole request is validated before anything is wr
     { "instanceId": "acme-prod-author", "pagePath": "/content/acme/us/en/home",
       "author": true, "published": true,
       "referencedAs": ["urn:aaid:aem:3f2a…", "vanity:summer-hero"],
+      "authorUrl": "https://author.acme.com",
+      "pageUrl": "https://author.acme.com/content/acme/us/en/home.html",
       "updatedAt": "2026-11-04T10:15:00.000Z" }
   ]
 }
 ```
 
+`authorUrl` and `pageUrl` appear only when the sending instance supplied a valid author URL. `pageUrl` is the author URL plus the URL-encoded page path plus `.html`.
+
 ## Build
 
-Neither project has been built against real AEM dependencies yet (see Verification status). On the first build, expect to fix small compile issues in the classes that use AEM APIs.
+Both projects build and their tests pass (see Verification status). Build against the SDK or uber-jar that matches the runtime you deploy to: a bundle built against a newer SDK can import package versions the target doesn't provide (for example `slf4j` 2.x), and then stays in the `Installed` state instead of starting.
 
 Set `aem.sdk.api.version` to the SDK version your Cloud project uses. The poms ship with a placeholder so you don't build against a mismatched version by accident.
 
@@ -176,6 +181,7 @@ Set these environment variables and secrets on the environment through Cloud Man
 
 - `DMREFS_INSTANCE_ID`
 - `DMREFS_ENDPOINT_URL`, set to `https://<assets-author>/bin/dmrefs/ingest`
+- `DMREFS_AUTHOR_URL` (optional), the public https URL of this author instance
 - secret `DMREFS_BEARER_TOKEN`
 
 ### 2b. Sites on 6.5 (on-prem or AMS)
@@ -184,6 +190,7 @@ Set these environment variables and secrets on the environment through Cloud Man
 2. The `$[env:…]` and `$[secret:…]` placeholders only work on Cloud Service. On 6.5, open `/system/console/configMgr` → **DM References - Tracker settings** and set:
    - `instance.id`, e.g. `acme-prod-author`
    - `endpoint.url`
+   - `author.url` (optional), the public https URL of this author instance
    - `bearer.token`. Encrypt it first at `/system/console/crypto`; values in the `{…}` form are decrypted automatically.
 3. Confirm the customer allows outbound HTTPS to `*.adobeaemcloud.com`, or route it through their proxy. The client uses JVM proxy system properties (`https.proxyHost` and so on).
 
@@ -194,7 +201,14 @@ Set these environment variables and secrets on the environment through Cloud Man
 3. Unpublish the page and wait for the next push: `published` should become `false`.
 4. Delete the page and wait for the next push: the row should disappear.
 
-On Sites, set `com.adobe.dmrefs` to DEBUG to see job and push activity.
+On Sites, set `com.adobe.dmrefs` to DEBUG to see job and push activity. At DEBUG the tracker logs, in order: the page event, the enqueued job, the scan result (reference count), "queued for push", the POST status and "pushed N page(s)". The first place the sequence stops is where the problem is. The log never contains the token or payloads.
+
+### Deployment notes
+
+- **Repoinit ACLs:** use `set principal ACL for <service user>`. A plain `set ACL for <service user>` is not effective on Cloud Service and on the SDK: the service user could not see `/var/dm-references` or `/content`.
+- **Reinstalling the Sites package resets `TrackerSettings`** to the package defaults. Re-apply the instance ID, endpoint, author URL and token afterwards. Updating a config through the Felix console replaces the whole config, so send every property.
+- **A re-push with an unchanged `seq` is ignored as stale.** To re-send a page, change it so its `seq` increases.
+- **Author URL must be https.** The receiver rejects `http` and any URL with credentials, query or fragment.
 
 ## Placeholders you must check
 
@@ -202,7 +216,7 @@ On Sites, set `com.adobe.dmrefs` to DEBUG to see job and push activity.
 |---|---|---|
 | **Vanity URL regex** | Sites `vanity.patterns` | The default assumes the vanity ID replaces the asset ID in `/adobe/assets/<id>/as/<seo-name>`. Match it to the customer's real delivery URLs. |
 | **Vanity metadata property** | Assets `vanity.metadata.property` | `dam:vanityId` is a placeholder. |
-| **Asset ID equals `jcr:uuid`** | Assets read endpoint | Assumes `urn:aaid:aem:<uuid>` uses the asset node's `jcr:uuid`. Confirm this. |
+| **Asset ID equals `jcr:uuid`** | Assets read endpoint | Confirmed for a local DAM asset on the RDE: `urn:aaid:aem:<uuid>` matches the asset's `jcr:uuid`. Not yet confirmed for a remote Dynamic Media asset. |
 | **SDK and uber-jar versions** | Both poms | Set them to the target environments. |
 
 ## Known MVP gaps and next steps
@@ -215,13 +229,22 @@ On Sites, set `com.adobe.dmrefs` to DEBUG to see job and push activity.
 - **References UI:** this MVP only provides the endpoint. Wiring it into the Assets References panel, and merging in CDN or Databricks results asynchronously, comes next.
 - **Rate limiting:** use AEM Cloud Service CDN traffic filter rules on `/bin/dmrefs/ingest`.
 - **Scale:** `/var` with sharding is fine for an MVP. At millions of references, move the store behind a dedicated service; the endpoint contract stays the same.
-- **Possible 403 on POST despite a valid token:** check the Granite CSRF filter and the Sling Referrer Filter. If either blocks it, exclude `/bin/dmrefs/ingest` for this server-to-server client.
+- **Possible 403 on POST despite a valid token:** not seen on the RDE test, where the bearer-token POST worked. If you do see it, check the Granite CSRF filter and the Sling Referrer Filter, and exclude `/bin/dmrefs/ingest` for this server-to-server client.
+
+### Hardening before real customer use
+
+- **Permanent push failures block the queue.** A `400` or `413` response is retried forever, and the oldest pending pages are always sent first. Fix: bisect the batch on a permanent 4xx and quarantine the single bad page.
+- **A full reconcile enqueues one job per page.** On a large site, run it in capped, resumable slices.
+- **Read endpoint limits.** `truncated` is true when exactly `max` rows come back, and the limit applies before merging by page.
+- **Housekeeping.** Prune empty acknowledged snapshots on Sites, tombstones (`deleted=true` page indexes) on Assets, and rows whose asset no longer exists.
+- **Size.** At about 1 to 2 pages per asset, the wrapper nodes (asset, instance and shard folders) outnumber the reference nodes. A flatter layout and `oak:Unstructured` for large folders would reduce them.
 
 ## Verification status
 
-- **Checked:** the plain-Java parts were compiled and their unit tests passed (14 tests):
-  - the reference extractor (UUID, legacy `dm-aid`, vanity, malformed input)
-  - path validation
-  - the JSON payload builder
-  - the ingest payload validator
-- **Not yet built:** the classes that use OSGi, Sling, JCR and replication couldn't be compiled here because the AEM dependencies aren't available offline. Build them against the uber-jar and the SDK. Expect small compile fixes on the first run.
+- **Compiled and tested:** all three builds succeed (Sites on 6.5 with Java 8, Sites with `-Pcloud`, and the Assets receiver). 18 unit tests pass (10 Sites, 8 Assets). They cover the extractor, path and author URL validation, the payload builder and the ingest validator. The classes that use OSGi, Sling and JCR have no unit tests.
+- **Verified end to end** between a local AEM SDK author (Sites side) and an RDE (Assets side), using UUID references:
+  - creating a reference on a page makes the row appear on the RDE
+  - replacing the image on a page removes the old row
+  - re-sending an unchanged `seq` is ignored as stale
+  - the author URL and `pageUrl` come back from the read endpoint
+- **Not tested yet:** publish and unpublish, page delete and move, vanity references, and the nightly reconcile.
