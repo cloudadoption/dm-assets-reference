@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "instanceId": "acme-prod-author",
+  "pages": [
+    {
+      "pagePath": "/content/acme/us/en/home",
+      "seq": 1730700000000,
+      "deleted": false,
+      "author": [
+        { "type": "uuid", "ref": "urn:aaid:aem:3f2a1b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b" },
+        { "type": "vanity", "ref": "summer-hero" }
+      ],
+      "published": [
+        { "type": "uuid", "ref": "urn:aaid:aem:3f2a1b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b" }
+      ]
+    },
+    {
+      "pagePath": "/content/acme/us/en/old-campaign",
+      "seq": 1730700000001,
+      "deleted": true,
+      "author": [],
+      "published": []
+    }
+  ]
+}

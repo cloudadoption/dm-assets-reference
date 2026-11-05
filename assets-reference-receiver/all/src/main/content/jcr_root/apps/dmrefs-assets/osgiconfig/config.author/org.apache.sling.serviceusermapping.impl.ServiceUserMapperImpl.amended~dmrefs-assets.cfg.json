@@ -1,0 +1,5 @@
+{
+  "user.mapping": [
+    "com.adobe.dmrefs.assets.core:writer=[dm-references-service]"
+  ]
+}

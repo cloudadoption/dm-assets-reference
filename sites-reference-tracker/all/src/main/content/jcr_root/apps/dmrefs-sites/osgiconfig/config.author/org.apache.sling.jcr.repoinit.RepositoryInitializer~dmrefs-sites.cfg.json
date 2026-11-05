@@ -1,0 +1,5 @@
+{
+  "scripts": [
+    "create service user dm-references-tracker with path system/cq:services/dmrefs\n\ncreate path (sling:Folder) /var/dm-references\n\nset principal ACL for dm-references-tracker\n    allow jcr:read on /content\n    allow jcr:read,rep:write on /var/dm-references\nend"
+  ]
+}

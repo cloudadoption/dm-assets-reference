@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.adobe.dmrefs</groupId>
+    <artifactId>dmrefs-sites</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>dmrefs-sites-all</artifactId>
+  <packaging>content-package</packaging>
+  <name>DM References - Sites author tracker (package: bundle + configs)</name>
+
+  <dependencies>
+    <dependency>
+      <groupId>com.adobe.dmrefs</groupId>
+      <artifactId>dmrefs-sites-core</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.jackrabbit</groupId>
+        <artifactId>filevault-package-maven-plugin</artifactId>
+        <extensions>true</extensions>
+        <configuration>
+          <group>com.adobe.dmrefs</group>
+          <name>dmrefs-sites-all</name>
+          <packageType>container</packageType>
+          <jcrRootSourceDirectory>src/main/content/jcr_root</jcrRootSourceDirectory>
+          <filterSource>src/main/content/META-INF/vault/filter.xml</filterSource>
+          <embeddeds>
+            <embedded>
+              <groupId>com.adobe.dmrefs</groupId>
+              <artifactId>dmrefs-sites-core</artifactId>
+              <target>/apps/dmrefs-sites/install</target>
+            </embedded>
+          </embeddeds>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

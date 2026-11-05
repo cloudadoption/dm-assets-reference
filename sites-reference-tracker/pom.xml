@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.adobe.dmrefs</groupId>
+  <artifactId>dmrefs-sites</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+  <packaging>pom</packaging>
+  <name>DM References - Sites author tracker (parent)</name>
+
+  <modules>
+    <module>core</module>
+    <module>all</module>
+  </modules>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <!-- Default build targets AEM 6.5 (Java 8). Use -Pcloud for AEM as a Cloud Service. -->
+    <java.release>8</java.release>
+    <!-- Adjust to the customer's service pack. -->
+    <aem65.uberjar.version>6.5.21</aem65.uberjar.version>
+    <!-- Set to the SDK version your Cloud project uses (see its root pom / Maven Central). -->
+    <aem.sdk.api.version>REPLACE_WITH_YOUR_AEM_SDK_API_VERSION</aem.sdk.api.version>
+    <bnd.version>6.4.0</bnd.version>
+    <junit.version>5.10.2</junit.version>
+  </properties>
+
+  <repositories>
+    <repository>
+      <id>adobe-public</id>
+      <url>https://repo.adobe.com/nexus/content/groups/public</url>
+      <releases><enabled>true</enabled></releases>
+      <snapshots><enabled>false</enabled></snapshots>
+    </repository>
+  </repositories>
+
+  <profiles>
+    <profile>
+      <id>aem65</id>
+      <activation><activeByDefault>true</activeByDefault></activation>
+      <dependencies>
+          <dependency>
+            <groupId>com.adobe.aem</groupId>
+            <artifactId>uber-jar</artifactId>
+            <version>${aem65.uberjar.version}</version>
+            <scope>provided</scope>
+          </dependency>
+      </dependencies>
+    </profile>
+    <profile>
+      <id>cloud</id>
+      <properties>
+        <java.release>11</java.release>
+      </properties>
+      <dependencies>
+          <dependency>
+            <groupId>com.adobe.aem</groupId>
+            <artifactId>aem-sdk-api</artifactId>
+            <version>${aem.sdk.api.version}</version>
+            <scope>provided</scope>
+          </dependency>
+      </dependencies>
+    </profile>
+  </profiles>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-compiler-plugin</artifactId>
+          <version>3.11.0</version>
+          <configuration>
+            <release>${java.release}</release>
+          </configuration>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>3.2.5</version>
+        </plugin>
+        <plugin>
+          <groupId>biz.aQute.bnd</groupId>
+          <artifactId>bnd-maven-plugin</artifactId>
+          <version>${bnd.version}</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-jar-plugin</artifactId>
+          <version>3.3.0</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.jackrabbit</groupId>
+          <artifactId>filevault-package-maven-plugin</artifactId>
+          <version>1.3.6</version>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+  </build>
+</project>

@@ -1,0 +1,23 @@
+{
+  "enabled": true,
+  "instance.id": "$[env:DMREFS_INSTANCE_ID;default=sites-dev]",
+  "endpoint.url": "$[env:DMREFS_ENDPOINT_URL;default=]",
+  "bearer.token": "$[secret:DMREFS_BEARER_TOKEN]",
+  "author.url": "$[env:DMREFS_AUTHOR_URL;default=]",
+  "allow.insecure.http": false,
+  "content.roots": ["/content"],
+  "uuid.patterns": [
+    "urn:aaid:aem:(?<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+    "dm-aid--(?<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+  ],
+  "vanity.patterns": [
+    "/adobe/assets/(?<vanity>(?!urn:)[A-Za-z0-9._~-]{1,200})/as/"
+  ],
+  "follow.properties": ["fragmentVariationPath", "fragmentPath"],
+  "follow.roots": ["/content/experience-fragments", "/content/dam"],
+  "max.follow.depth": 3,
+  "max.nodes.per.page": 5000,
+  "push.batch.size": 100,
+  "connect.timeout.ms": 5000,
+  "socket.timeout.ms": 15000
+}

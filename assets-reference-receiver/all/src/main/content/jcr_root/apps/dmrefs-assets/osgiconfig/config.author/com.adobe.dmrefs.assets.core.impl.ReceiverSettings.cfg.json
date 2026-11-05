@@ -1,0 +1,9 @@
+{
+  "writer.group": "dm-reference-writers",
+  "max.body.bytes": 1048576,
+  "max.pages.per.request": 200,
+  "max.refs.per.page": 500,
+  "vanity.metadata.property": "dam:vanityId",
+  "allowed.instance.ids": [],
+  "max.references.returned": 1000
+}

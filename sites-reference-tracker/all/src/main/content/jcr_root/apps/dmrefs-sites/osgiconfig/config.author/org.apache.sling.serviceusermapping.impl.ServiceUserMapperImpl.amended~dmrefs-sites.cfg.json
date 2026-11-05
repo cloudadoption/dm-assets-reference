@@ -1,0 +1,5 @@
+{
+  "user.mapping": [
+    "com.adobe.dmrefs.sites.core:tracker=[dm-references-tracker]"
+  ]
+}
