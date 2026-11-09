@@ -2,7 +2,7 @@
 
 ## In one sentence
 
-When an author puts a Dynamic Media image on a website page, AEM Assets learns about it within about 30 seconds. Anyone looking at the image can then see every page that uses it.
+When an author puts a Dynamic Media image on a website page, AEM Assets learns about it within about a minute, even if the page is not published yet. Anyone looking at the image can then see every page that uses it, and whether each page is live or still a draft.
 
 ## The problem today
 
@@ -14,13 +14,13 @@ When someone in Assets asks "Can I delete or change this image? Where is it used
 
 ![Architecture diagram](dm-references-architecture.png)
 
-1. **The author edits a page.** They add, swap or remove an image, then publish or unpublish the page.
-2. **The Reference Tracker notices.** This small add-on on the Sites side records which images the page uses, both in the draft and on the live site.
-3. **It sends a short update.** About every 30 seconds it sends Assets a note such as "this page now uses these images." The connection only goes **out** from the customer's network, so their firewall rules don't need to change.
-4. **The Reference Receiver records it.** On the Assets side, it checks the sender is allowed and updates the index of which pages use which images.
+1. **The author edits a page.** They add, swap or remove an image. Publishing or unpublishing the page counts too.
+2. **The Reference Tracker notices.** This small add-on on the Sites side waits until the author has stopped editing for a minute, then reads the page as it is now and records which images it uses, in the draft and on the live site. It reads the page once for a whole editing session, not once per save, and does nothing if the images didn't change. That includes images that come from the page's template, such as a logo or header.
+3. **It sends a short update.** It sends Assets a note such as "this page now uses these images." The connection only goes **out** from the customer's network, so their firewall rules don't need to change.
+4. **The Reference Receiver records it.** On the Assets side, it checks the sender is allowed and updates the index of which pages use which images. The draft list and the live list are kept apart, so editing a draft never changes what is shown as live.
 5. **Anyone can look it up.** Open an image and you see the pages using it.
 
-A **nightly double-check** re-reads recently changed pages, so nothing is missed if an update gets lost.
+Pages that were already live before the tracker was installed are loaded once with a **catch-up run** that an administrator starts by hand.
 
 Think of it as a library card system. Every time a book (image) is placed on a shelf (page), a card is filed. When the book moves, the card is updated. Ask about any book and the cards tell you where it is.
 
@@ -28,11 +28,15 @@ Think of it as a library card system. Every time a book (image) is placed on a s
 
 | What the author does | What Assets shows (within about a minute) |
 |---|---|
-| Maria adds `summer-hero.jpg` to the *Summer Sale* page and publishes it | `summer-hero.jpg` → *Summer Sale* page, **draft and live** |
-| Maria edits the page again but hasn't published yet | Still shows **live**, because the live page hasn't changed |
+| Maria adds `summer-hero.jpg` to the *Summer Sale* page, not published yet | `summer-hero.jpg` → *Summer Sale* page, **draft** (within about a minute) |
+| Maria publishes the page | The same row now says **draft and live** |
+| Maria edits the text only | Nothing changes, and nothing is sent |
 | Maria replaces the image with `autumn-hero.jpg` and publishes | `summer-hero.jpg` no longer lists the page. `autumn-hero.jpg` does |
-| The page is unpublished | The page is still listed, but marked **draft only** (not live) |
+| Maria removes an image from the draft but doesn't publish yet | The row says **live only**, because the live page hasn't changed |
+| The page is unpublished | The row stays, marked **draft only** |
 | The page is deleted | The page disappears from the image's list |
+| The page is moved | The old address disappears. The new address appears once it is edited or published |
+| The logo in the page template is a Dynamic Media image | Every page that uses the template is listed for that logo, once it is published or edited |
 | The page uses a friendly image name (a "vanity ID") like `summer-hero` instead of the image's internal ID | Assets matches the name to the right image and shows it the same way |
 
 What a user sees when they look up an image:
@@ -47,7 +51,7 @@ summer-hero.jpg
 
 | | Before | Now |
 |---|---|---|
-| **Speed** | Hours to days | About 30 seconds |
+| **Speed** | Hours to days | About a minute after an edit, seconds after publishing |
 | **Works behind a customer firewall** | Often not | Yes: outgoing only |
 | **Shows unpublished drafts** | No | Yes |
 | **Needs extra provisioning per customer** | Yes (log storage) | No |
@@ -61,7 +65,7 @@ No. The tracker works in the background after the author saves.
 Only the page address and the image identifiers are sent. The connection is encrypted and uses a secure access key. Only an approved account can send updates, and people only see references for images they're allowed to open.
 
 **What if the connection is down?**
-Updates wait and are re-sent automatically. Nothing is lost.
+Updates wait and are re-sent automatically, for up to about a day. Nothing is lost.
 
 **Does it change the images themselves?**
 No. References are stored separately, so the images are never touched.
@@ -71,8 +75,10 @@ No. They work together: this approach shows where images are *placed*, and traff
 
 ## Current limits (MVP)
 
-- If an image sits inside a shared block (an **Experience Fragment**) and that block is edited, the pages that use the block update at the nightly double-check, not instantly.
-- "Live" means the page was *sent* to the live site. If publishing is stuck, it can show live a little early until the nightly check corrects it.
+- Draft tracking is **best effort**. If the system restarts while an author's latest edits are still waiting, those edits are picked up at the next edit of the page.
+- If an image sits inside a shared block (an **Experience Fragment**) or a page template, and that block or template is edited, pages keep showing the old images until they are edited or published again, or the catch-up run is repeated.
+- "Live" means the page was *sent* to the live site. If publishing is stuck, it can show live a little early.
+- A short wait (10 seconds by default) happens between publishing and the update. If it is set much longer, a newly published image can look unused for that long.
 - For now the results come from a lookup address. They don't yet appear in the Assets screens.
 
 ## Glossary
@@ -90,7 +96,7 @@ No. They work together: this approach shows where images are *placed*, and traff
 
 Code, setup steps and the API details are in the project [README](../../README.md).
 
-- **Sites side:** event listeners and a background job, with a local record of each page's images.
+- **Sites side:** a publish listener and a page-edit listener, with delayed background jobs. It keeps no local record of its own.
 - **Assets side:** two endpoints:
   - `POST /bin/dmrefs/ingest` receives the updates
   - `GET /bin/dmrefs/references?path=/content/dam/...` looks them up

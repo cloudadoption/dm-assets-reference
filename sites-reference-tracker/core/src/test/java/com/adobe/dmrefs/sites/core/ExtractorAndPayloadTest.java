@@ -2,8 +2,8 @@ package com.adobe.dmrefs.sites.core;
 
 import com.adobe.dmrefs.sites.core.extract.ReferenceExtractor;
 import com.adobe.dmrefs.sites.core.impl.PushPayload;
+import com.adobe.dmrefs.sites.core.model.PageUpdate;
 import com.adobe.dmrefs.sites.core.model.Ref;
-import com.adobe.dmrefs.sites.core.model.Snapshot;
 import com.adobe.dmrefs.sites.core.util.Hashes;
 import org.junit.jupiter.api.Test;
 
@@ -69,13 +69,6 @@ class ExtractorAndPayloadTest {
     }
 
     @Test
-    void refRoundTrip() {
-        Ref r = new Ref(Ref.Type.VANITY, "a|b");
-        assertEquals(r, Ref.decode(r.encode()));
-        assertEquals(null, Ref.decode("bogus"));
-    }
-
-    @Test
     void contentPathValidation() {
         assertTrue(Hashes.isValidContentPath("/content/acme/en/home"));
         assertFalse(Hashes.isValidContentPath("/content/acme/../../etc"));
@@ -87,20 +80,54 @@ class ExtractorAndPayloadTest {
 
     @Test
     void payloadIsValidAndEscaped() {
-        Snapshot s = new Snapshot("/content/acme/\"quoted\"");
-        s.seq = 42;
-        s.authorRefs.add(new Ref(Ref.Type.UUID, "urn:aaid:aem:" + UUID));
-        s.publishedRefs.add(new Ref(Ref.Type.VANITY, "summer-hero"));
-        String json = PushPayload.build("acme-prod", null, Collections.singletonList(s));
+        Set<Ref> published = new TreeSet<>();
+        published.add(new Ref(Ref.Type.VANITY, "summer-hero"));
+        PageUpdate p = PageUpdate.published("/content/acme/\"quoted\"", 42, false, published);
+        String json = PushPayload.build("acme-prod", null, Collections.singletonList(p));
         assertEquals("{\"schemaVersion\":1,\"instanceId\":\"acme-prod\",\"pages\":[{\"pagePath\":"
-                + "\"/content/acme/\\\"quoted\\\"\",\"seq\":42,\"deleted\":false,"
-                + "\"author\":[{\"type\":\"uuid\",\"ref\":\"urn:aaid:aem:" + UUID + "\"}],"
-                + "\"published\":[{\"type\":\"vanity\",\"ref\":\"summer-hero\"}]}]}", json);
+                + "\"/content/acme/\\\"quoted\\\"\",\"seq\":42,\"deleted\":false,\"published\":"
+                + "[{\"type\":\"vanity\",\"ref\":\"summer-hero\"}]}]}", json);
+    }
+
+    @Test
+    void draftUpdateCarriesOnlyTheAuthorSetAndDeletedCarriesNeither() {
+        Set<Ref> refs = new TreeSet<>();
+        refs.add(new Ref(Ref.Type.VANITY, "summer-hero"));
+        PageUpdate draft = PageUpdate.draft("/content/a", 5, false, refs);
+        PageUpdate gone = PageUpdate.deleted("/content/b", 6);
+        String json = PushPayload.build("acme-prod", null, java.util.Arrays.asList(draft, gone));
+        assertEquals("{\"schemaVersion\":1,\"instanceId\":\"acme-prod\",\"pages\":["
+                + "{\"pagePath\":\"/content/a\",\"seq\":5,\"deleted\":false,"
+                + "\"author\":[{\"type\":\"vanity\",\"ref\":\"summer-hero\"}]},"
+                + "{\"pagePath\":\"/content/b\",\"seq\":6,\"deleted\":true}]}", json);
+    }
+
+    @Test
+    void payloadWritesPartialOnlyWhenTrue() {
+        PageUpdate partial = PageUpdate.published("/content/a", 1, true, Collections.<Ref>emptySet());
+        PageUpdate full = PageUpdate.published("/content/b", 2, false, Collections.<Ref>emptySet());
+        String json = PushPayload.build("acme-prod", null, java.util.Arrays.asList(partial, full));
+        assertTrue(json.contains("\"pagePath\":\"/content/a\",\"seq\":1,\"deleted\":false,\"partial\":true,"));
+        assertFalse(json.substring(json.indexOf("/content/b")).contains("partial"));
+    }
+
+    @Test
+    void extractsPercentEncodedAndJsonEscapedUrns() {
+        assertEquals(Collections.singleton(new Ref(Ref.Type.UUID, "urn:aaid:aem:" + UUID)),
+                run("/adobe/assets/urn%3Aaaid%3Aaem%3A" + UUID + "/as/x.jpg"));
+        assertEquals(Collections.singleton(new Ref(Ref.Type.UUID, "urn:aaid:aem:" + UUID)),
+                run("{\"src\":\"https:\\/\\/d.example.com\\/adobe\\/assets\\/urn:aaid:aem:" + UUID + "\\/as\\/x.jpg\"}"));
+    }
+
+    @Test
+    void badPercentEncodingDoesNotHideAPlainMatch() {
+        Set<Ref> r = run("100% urn:aaid:aem:" + UUID + " %ZZ");
+        assertEquals(Collections.singleton(new Ref(Ref.Type.UUID, "urn:aaid:aem:" + UUID)), r);
     }
 
     @Test
     void payloadIncludesAuthorUrlWhenSet() {
-        String json = PushPayload.build("acme-prod", "https://author.acme.com", Collections.<Snapshot>emptyList());
+        String json = PushPayload.build("acme-prod", "https://author.acme.com", Collections.<PageUpdate>emptyList());
         assertEquals("{\"schemaVersion\":1,\"instanceId\":\"acme-prod\","
                 + "\"authorUrl\":\"https://author.acme.com\",\"pages\":[]}", json);
     }

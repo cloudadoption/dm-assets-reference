@@ -5,13 +5,13 @@ This MVP shows, close to real time, which Sites pages reference a Dynamic Media 
 ```
  Sites AUTHOR (6.5 on-prem / AMS / Cloud)                       Assets AUTHOR (Cloud Service)
  ┌───────────────────────────────────────────┐                ┌─────────────────────────────────────┐
- │ PageEvent ─┐                              │                │ POST /bin/dmrefs/ingest             │
- │ Replication├─► Sling job ─► scan page ───►│ /var snapshot  │   authN: IMS bearer                 │
- │ Reconcile ─┘   (per page)   (+XF/CF)      │ + pending queue│   authZ: dm-reference-writers group │
- │                                           │       │        │   validate ─► vanity→uuid ─► /var   │
- │ Push task (every 30s, batch ≤100) ────────┼───────┘ HTTPS ►│                                     │
- └───────────────────────────────────────────┘   (outbound)   │ GET  /bin/dmrefs/references         │
-                                                               │   ?assetId=urn:aaid:aem:… | ?path=… │
+ │ Replication event ─► delayed Sling job    │                │ POST /bin/dmrefs/ingest             │
+ │ (Activate/Deactivate/Delete)  (~10 s)     │                │   authN: IMS OAuth token            │
+ │   │ read page's CURRENT status, scan page │                │   authZ: dm-reference-writers group │
+ │   ▼ + template structure (cached)         │ HTTPS          │   validate ─► vanity→uuid ─► /var   │
+ │ push batch ───────────────────────────────┼─(outbound)────►│                                     │
+ │ Manual JMX backfill ─► same queue         │                │ GET  /bin/dmrefs/references         │
+ └───────────────────────────────────────────┘                │   ?assetId=urn:aaid:aem:… | ?path=… │
                                                                └─────────────────────────────────────┘
 ```
 
@@ -35,23 +35,28 @@ dm-asset-references/
 
 ## Sites side: how it works
 
-| Trigger | Job action | Effect on the snapshot |
-|---|---|---|
-| Page created, modified or restored | `AUTHOR_CHANGED` | Rescans the page and updates `authorRefs` |
-| Page moved | `DELETED` (source) + `AUTHOR_CHANGED` (destination) | |
-| Page deleted | `DELETED` | Clears both sets and sets `deleted=true` |
-| Replication: Activate | `PUBLISHED` | Rescans the page. `publishedRefs` = `authorRefs` = current content, `publishedAt=now` |
-| Replication: Deactivate or Delete | `UNPUBLISHED` | Clears `publishedRefs` |
-| Reconcile (daily at 02:30) | `RECONCILE` | Rescans pages changed or replicated since the last run. Uses `cq:lastReplicationAction` to correct `publishedRefs`. Snapshots whose page no longer exists get `DELETED` |
+Sites is **stateless**. It stores nothing. It tracks **publish, unpublish and delete** reliably (queued and retried), and **page edits** best effort. The Sites service user has `jcr:read` on `/content` and `/conf` only.
+
+| Trigger | What happens |
+|---|---|
+| Replication: Activate, Deactivate or Delete | `ReplicationEventListener` queues one Sling job per chunk of paths, scheduled `job.delay.seconds` (default 10) in the future |
+| The publish job runs (queue `dmrefs-publish`) | For each path it **ignores the event's action** and reads the page's current `cq:lastReplicationAction`. `Activate` means live: scan and send the **published** set. Anything else means not live: send an empty published set. A missing page is sent as deleted (both sets cleared) |
+| Page edit (create, modify, restore, move, delete) | `DraftTracker` notes the page in memory. Once the page has had no edits for `draft.quiet.seconds` (default 60), or `draft.max.wait.seconds` (default 300) have passed, its sweep (every 15 s) queues it. The draft job (queue `dmrefs-draft`) scans it and sends the **draft** set, unless its references are unchanged since the last delivery (fingerprint): then there is no HTTP call |
+| Manual backfill (JMX) | Queues every page under a root whose last action is `Activate`, in chunks with a pause between them. It loads published sets only; a page's draft set arrives with its next edit |
 
 - **Scanning** reads every String and String[] property under `jcr:content` and matches it against the configured regexes:
-  - `uuid` patterns: `urn:aaid:aem:<uuid>` and the legacy `dm-aid--<uuid>`.
+  - `uuid` patterns: `urn:aaid:aem:<uuid>` and the legacy `dm-aid--<uuid>`. Percent-encoded (`urn%3Aaaid%3Aaem%3A…`) and JSON-escaped (`\/`) URLs are decoded before matching.
   - `vanity` patterns.
-  - It follows `fragmentVariationPath` and `fragmentPath` into Experience Fragments and Content Fragments, up to depth 3, with cycle protection and a cap of 5,000 nodes per page.
-- **Snapshots** are stored at `/var/dm-references/pages/<h0h1>/<sha256(pagePath)>`. A snapshot is only written when the page references at least one DM asset, or used to. A change bumps `seq` and adds a marker under `/var/dm-references/pending/`.
-- **The push task** runs on a single cluster node every 30 seconds, sending up to 10 batches of 100 pages per run. A page stays pending until Assets acknowledges exactly the `seq` that was sent, so failed pushes retry automatically. Once a deleted page's push is acknowledged, its snapshot is removed.
-- **Full rebuild:** delete the `lastReconcile` property on `/var/dm-references/state`. The next reconcile run then processes every page.
-- **Author only:** nothing runs on publish.
+  - It follows `fragmentVariationPath` and `fragmentPath` into Experience Fragments and Content Fragments, up to depth 3, with cycle protection and a cap of 20,000 nodes per page. A page that hits the cap is sent as `partial`, so Assets only adds references and never removes any.
+- **Template structure:** the page's `cq:template` structure (`<template>/structure/jcr:content`) is scanned too, so a logo or header in the template counts as a reference from every page that uses it. Results are cached per template and re-checked against the last-modified time of the structure and of each fragment it embeds, with a TTL (`template.cache.ttl.seconds`, default 600). Policies are not scanned.
+- **Repeat publishes are merged:** a page published several times inside the delay window is scanned and pushed once. A page's "already delivered" mark is only set after Assets answers `2xx`, so a failed push is never skipped on retry.
+- **Failures:** `5xx`, transport errors and auth failures fail the job, and Sling retries it (queue `dmrefs-publish`: ordered, 288 retries, 5 minutes apart, about 24 hours). A `400` or `413` makes the job resend each page on its own, so one bad page is logged at ERROR and dropped without blocking the queue.
+- **Authentication:** `auth.mode=oauth` (default) exchanges the technical account's client credentials at IMS (`ims.token.url`, restricted to known Adobe IMS hosts) and keeps the token in memory until 5 minutes before it expires. On a `401` or `403` it refreshes once and retries. `auth.mode=static` uses `bearer.token` and is for development only.
+- **Backfill:** `com.adobe.dmrefs:type=Backfill` in `/system/console/jmx` has `start(root)`, `status()` and `cancel()`. It runs in its own queue (`dmrefs-backfill`), isn't resumable (run it again after a restart; Assets applies by `seq`), and doesn't wait for the job delay. There's no servlet, so no new HTTP surface on Sites.
+- **Draft and published are independent.** A publish update carries only `published[]` and a draft update only `author[]`; Assets leaves the other set alone, so unpublishing keeps a page's draft rows and editing a draft never touches what is live.
+- **Draft cost:** an edit costs one in-memory update (no JCR access). Forty saves over ten minutes make a few scans, not forty. An edit that changes no DM reference costs one scan and no HTTP call. With nothing edited, the sweeper does no JCR read and no HTTP call. `draft.ignored.users` (default `replication-service`) lists users whose edits are skipped; set `draft.enabled=false` to switch the whole path off.
+- **Author only:** nothing runs on publish servers, and there's no scheduled bulk job.
+- **Limits:** a draft edit still waiting in memory is lost on a restart (the next edit of that page restores it), and an Experience Fragment or template edit is not seen by pages until they are edited, republished or backfilled (spec §8).
 
 ## Assets side: how it works
 
@@ -66,7 +71,9 @@ pages/<instanceId>/<p0p1>/<sha256(pagePath)>
     instanceId, pagePath, seq, deleted, keys[], updatedAt
 ```
 
-- **Asset nodes are never modified.** There's one node per (asset, instance, page), so many pages referencing one popular asset don't cause write conflicts.
+- **Asset nodes are never modified.** There's one node per (asset, instance, page), so many pages referencing one popular asset don't cause write conflicts. Reference nodes are `oak:Unstructured`, because popular assets collect very large child lists that are slow on orderable node types.
+- **A `partial` page only adds.** If the sender's scan was cut short, nothing is deleted and flags are never cleared; the page index keeps the old and new keys.
+- **An unseen page with no references writes nothing.** Unpublishing a page that was never tracked leaves no node behind.
 - **Each push replaces the page's previous entries.** The page index records which entries belong to the page, so stale entries are deleted and the store converges no matter how often a page is re-sent. A `seq` lower than or equal to the stored one is ignored as stale, which makes retries and out-of-order deliveries safe.
 - **Vanity resolution** happens at ingest. The receiver runs a JCR-SQL2 query with a bound parameter on `jcr:content/metadata/<vanity.metadata.property>`:
   - If exactly one asset matches, the entry is stored under that asset's UUID, with `referencedAs: ["vanity:summer-hero"]`.
@@ -79,7 +86,7 @@ pages/<instanceId>/<p0p1>/<sha256(pagePath)>
 
 - **Headers:** `Authorization: Bearer <IMS token>` and `Content-Type: application/json`.
 - **Who can call it:** the caller must be in the group `dm-reference-writers`.
-- **Body:** see `sample-ingest.json`. Each page carries its **full** author and published sets (replace semantics, not diffs). That makes every push idempotent and safe to apply in any order, and each page's sets are small.
+- **Body:** see `sample-ingest.json`. Each page entry carries the full set of **one or both** states (replace semantics, not diffs). `author[]` is the draft set and `published[]` the live set; **a set that is absent is left unchanged**, and a present one, even empty, replaces the stored set. A `deleted` page clears both. The Sites tracker sends only one set per entry. That makes every push idempotent and safe to apply in any order, and each page's sets are small.
 
 | Field | Rule |
 |---|---|
@@ -88,9 +95,10 @@ pages/<instanceId>/<p0p1>/<sha256(pagePath)>
 | `authorUrl` | Optional. Public https base URL of the sending author instance, e.g. `https://author.acme.com`. No credentials, query or fragment, at most 200 characters. An invalid value fails validation with `400`. |
 | `pages` | 1–200 per request, no duplicate `pagePath` |
 | `pagePath` | Under `/content`, at most 1024 characters, no `..`, no `[]\|*` or control characters |
-| `seq` | Positive long, increasing per page |
-| `deleted` | If `true`, both sets must be empty |
-| `author[]` / `published[]` | Up to 500 each. `{"type":"uuid","ref":"urn:aaid:aem:<uuid>"}` or `{"type":"vanity","ref":"[A-Za-z0-9._~-]{1,200}"}` |
+| `seq` | Positive long. Tracked per state (`author` and `published`), so a draft update is never dropped because of a newer publish update |
+| `deleted` | If `true`, both sets must be empty or absent, and `partial` must not be set |
+| `partial` | Optional boolean. `true` means the sender's scan was cut short, so Assets only adds references (nothing is removed) |
+| `author[]` / `published[]` | Optional, but an entry needs at least one unless `deleted`. Up to 500 each. `{"type":"uuid","ref":"urn:aaid:aem:<uuid>"}` or `{"type":"vanity","ref":"[A-Za-z0-9._~-]{1,200}"}` |
 
 The body is capped at 1 MB. The whole request is validated before anything is written.
 
@@ -153,10 +161,8 @@ aio aem rde install assets-reference-receiver/all/target/dmrefs-assets-all-0.1.0
 ```
 
 1. Set `vanity.metadata.property` in `ReceiverSettings` to wherever the customer stores vanity IDs.
-2. Get a token:
-   - For a quick test, use the Developer Console **local development token** (it expires after 24 hours).
-   - For longer runs, create a **service credential** (technical account) and exchange it for an access token.
-3. Make one call with the token so its user is created in AEM. Then add that user to **`dm-reference-writers`**.
+2. Create an **OAuth server-to-server credential** (technical account) for the Assets environment. The Sites tracker exchanges its client ID and secret for a token at IMS and refreshes it automatically. For a quick manual `curl`, the Developer Console **local development token** also works (it expires after 24 hours).
+3. Make one call with the token so its user is created in AEM, then find the user's AEM ID with `GET /libs/granite/security/currentuser.json`. It is `<guid>@techacct.adobe.com` and differs from the `email` in the credential JSON. Add that user to **`dm-reference-writers`**. If you do it with repoinit, quote the ID: `add "<guid>@techacct.adobe.com" to group dm-reference-writers`.
 
 Smoke-test the receiver directly:
 
@@ -182,7 +188,7 @@ Set these environment variables and secrets on the environment through Cloud Man
 - `DMREFS_INSTANCE_ID`
 - `DMREFS_ENDPOINT_URL`, set to `https://<assets-author>/bin/dmrefs/ingest`
 - `DMREFS_AUTHOR_URL` (optional), the public https URL of this author instance
-- secret `DMREFS_BEARER_TOKEN`
+- `DMREFS_IMS_CLIENT_ID`, and secret `DMREFS_IMS_CLIENT_SECRET` (the technical account)
 
 ### 2b. Sites on 6.5 (on-prem or AMS)
 
@@ -191,22 +197,25 @@ Set these environment variables and secrets on the environment through Cloud Man
    - `instance.id`, e.g. `acme-prod-author`
    - `endpoint.url`
    - `author.url` (optional), the public https URL of this author instance
-   - `bearer.token`. Encrypt it first at `/system/console/crypto`; values in the `{…}` form are decrypted automatically.
+   - `auth.mode` = `oauth`, with `ims.client.id` and `ims.client.secret`. Encrypt the secret first at `/system/console/crypto`; values in the `{…}` form are decrypted automatically.
+   - `job.delay.seconds` (default 10): how long to wait after a publish before reading the page. A longer delay merges repeat publishes but means a newly published asset shows as unused for that long.
 3. Confirm the customer allows outbound HTTPS to `*.adobeaemcloud.com`, or route it through their proxy. The client uses JVM proxy system properties (`https.proxyHost` and so on).
 
 ### 3. End-to-end check
 
 1. Edit a Sites page so it uses a DM asset, then publish it.
-2. Within about 30 seconds, `GET /bin/dmrefs/references?...` on Assets should show the page with `author: true, published: true`.
-3. Unpublish the page and wait for the next push: `published` should become `false`.
-4. Delete the page and wait for the next push: the row should disappear.
+2. After the job delay (10 s by default) plus a second or two, `GET /bin/dmrefs/references?...` on Assets should show the page with `published: true`. Before publishing, an edit shows up as `author: true, published: false` once the page has been quiet for `draft.quiet.seconds` (default 60) plus up to 15 s for the sweeper.
+3. Remove the image from the draft: `author` becomes false while `published` stays true until you republish.
+4. Unpublish the page: `published` becomes false and the draft row stays.
+5. Delete the page: the row should disappear.
+6. To load pages that were already published before the tracker was installed, call `start("/content/<site>")` on the `com.adobe.dmrefs:type=Backfill` MBean in `/system/console/jmx`, then watch `status()`.
 
-On Sites, set `com.adobe.dmrefs` to DEBUG to see job and push activity. At DEBUG the tracker logs, in order: the page event, the enqueued job, the scan result (reference count), "queued for push", the POST status and "pushed N page(s)". The first place the sequence stops is where the problem is. The log never contains the token or payloads.
+On Sites, set `com.adobe.dmrefs` to DEBUG to see activity. At DEBUG the tracker logs, in order: the replication event and queued paths, the scan result (reference count), the IMS token fetch, the POST status and "pushed N page(s)". The first place the sequence stops is where the problem is. The log never contains the token, the secret or payloads.
 
 ### Deployment notes
 
-- **Repoinit ACLs:** use `set principal ACL for <service user>`. A plain `set ACL for <service user>` is not effective on Cloud Service and on the SDK: the service user could not see `/var/dm-references` or `/content`.
-- **Reinstalling the Sites package resets `TrackerSettings`** to the package defaults. Re-apply the instance ID, endpoint, author URL and token afterwards. Updating a config through the Felix console replaces the whole config, so send every property.
+- **Repoinit ACLs:** use `set principal ACL for <service user>`. A plain `set ACL for <service user>` is not effective on Cloud Service and on the SDK: the service user could not see `/content` or `/conf`.
+- **Reinstalling the Sites package resets `TrackerSettings`** to the package defaults. Re-apply the instance ID, endpoint, author URL and credentials afterwards. Updating a config through the Felix console replaces the whole config, so send every property.
 - **A re-push with an unchanged `seq` is ignored as stale.** To re-send a page, change it so its `seq` increases.
 - **Author URL must be https.** The receiver rejects `http` and any URL with credentials, query or fragment.
 
@@ -216,35 +225,35 @@ On Sites, set `com.adobe.dmrefs` to DEBUG to see job and push activity. At DEBUG
 |---|---|---|
 | **Vanity URL regex** | Sites `vanity.patterns` | The default assumes the vanity ID replaces the asset ID in `/adobe/assets/<id>/as/<seo-name>`. Match it to the customer's real delivery URLs. |
 | **Vanity metadata property** | Assets `vanity.metadata.property` | `dam:vanityId` is a placeholder. |
-| **Asset ID equals `jcr:uuid`** | Assets read endpoint | Confirmed for a local DAM asset on the RDE: `urn:aaid:aem:<uuid>` matches the asset's `jcr:uuid`. Not yet confirmed for a remote Dynamic Media asset. |
+| **Asset ID equals `jcr:uuid`** | Assets read endpoint | Confirmed on the RDE for local DAM assets (`/content/dam/snow/image1.jpg` and `image9.jpg`): `urn:aaid:aem:<uuid>` is the asset's `jcr:uuid`. |
 | **SDK and uber-jar versions** | Both poms | Set them to the target environments. |
 
 ## Known MVP gaps and next steps
 
-- **Experience Fragment edits** don't re-trigger the pages that embed them, so those pages update at the next reconcile run. Next step: on an XF change, query for pages that reference that XF and enqueue them.
-- **Published refs during reconcile** are rebuilt from current author content. That's exact when the page wasn't edited after its last activation, and approximate otherwise. The live event path is exact.
-- **"Published" means activation was triggered, not delivered.** If the publish queue is blocked, the page still shows as published; reconcile corrects it later.
+The deferred items and the point at which to reconsider each are in `docs/spec-v2-stateless-tracker.md` §8.
+
+- **Draft tracking is best effort.** Edits still waiting in memory are lost on a restart (the next edit of that page restores it). Edits by users on `draft.ignored.users`, and changes that bypass page events, are missed. Existing drafts are not loaded by the backfill; a page's draft set arrives with its next edit.
+- **Experience Fragment and template edits** are not seen by pages until those pages are edited, republished or backfilled.
+- **No background repair.** Drift (a lost event, a restart mid-job) persists until the page is edited, republished or backfilled. A backfill adds and updates, but does not remove pages that were deleted while Sites was not tracking.
+- **"Published" means activation was requested, not delivered.** If the publish queue is blocked, the page still shows as published.
+- **A long `job.delay.seconds`** makes a newly published asset look unused for that long.
+- **Backfill is JMX-only,** so it is not available on Cloud Service production. Cloud Service Sites is out of scope for this version.
 - **Vanity performance:** add an Oak property index for the vanity metadata property on Assets.
 - **Unresolved vanity IDs** are only re-resolved when they're read or when the page is pushed again. Next step: listen for vanity changes on Assets and re-key entries.
 - **References UI:** this MVP only provides the endpoint. Wiring it into the Assets References panel, and merging in CDN or Databricks results asynchronously, comes next.
 - **Rate limiting:** use AEM Cloud Service CDN traffic filter rules on `/bin/dmrefs/ingest`.
 - **Scale:** `/var` with sharding is fine for an MVP. At millions of references, move the store behind a dedicated service; the endpoint contract stays the same.
-- **Possible 403 on POST despite a valid token:** not seen on the RDE test, where the bearer-token POST worked. If you do see it, check the Granite CSRF filter and the Sling Referrer Filter, and exclude `/bin/dmrefs/ingest` for this server-to-server client.
+- **Possible 403 on POST despite a valid token:** not seen on the RDE test, where the OAuth token POST worked. If you do see it, check the Granite CSRF filter and the Sling Referrer Filter, and exclude `/bin/dmrefs/ingest` for this server-to-server client.
 
 ### Hardening before real customer use
 
-- **Permanent push failures block the queue.** A `400` or `413` response is retried forever, and the oldest pending pages are always sent first. Fix: bisect the batch on a permanent 4xx and quarantine the single bad page.
-- **A full reconcile enqueues one job per page.** On a large site, run it in capped, resumable slices.
-- **Read endpoint limits.** `truncated` is true when exactly `max` rows come back, and the limit applies before merging by page.
-- **Housekeeping.** Prune empty acknowledged snapshots on Sites, tombstones (`deleted=true` page indexes) on Assets, and rows whose asset no longer exists.
-- **Size.** At about 1 to 2 pages per asset, the wrapper nodes (asset, instance and shard folders) outnumber the reference nodes. A flatter layout and `oak:Unstructured` for large folders would reduce them.
+- **Read endpoint limits.** `truncated` is true when exactly `max` rows come back, and the limit applies before merging by page. A template logo on every page produces one row per page.
+- **Housekeeping.** Tombstones (`deleted=true` page indexes) on Assets, and rows whose asset no longer exists.
+- **Size.** At about 1 to 2 pages per asset, the wrapper nodes (asset, instance and shard folders) outnumber the reference nodes. A flatter layout would reduce them.
+- **Real 6.5 / AMS author.** The scenarios were run on the Cloud SDK. Re-check replication status timing, move events and the job delay on AMS.
 
 ## Verification status
 
-- **Compiled and tested:** all three builds succeed (Sites on 6.5 with Java 8, Sites with `-Pcloud`, and the Assets receiver). 18 unit tests pass (10 Sites, 8 Assets). They cover the extractor, path and author URL validation, the payload builder and the ingest validator. The classes that use OSGi, Sling and JCR have no unit tests.
-- **Verified end to end** between a local AEM SDK author (Sites side) and an RDE (Assets side), using UUID references:
-  - creating a reference on a page makes the row appear on the RDE
-  - replacing the image on a page removes the old row
-  - re-sending an unchanged `seq` is ignored as stale
-  - the author URL and `pageUrl` come back from the read endpoint
-- **Not tested yet:** publish and unpublish, page delete and move, vanity references, and the nightly reconcile.
+- **Compiled and tested:** both Sites builds (AEM 6.5 with Java 8, and `-Pcloud` with Java 11) and the Assets receiver build succeed. 52 unit tests pass (35 Sites, 17 Assets). They cover the extractor (including encoded URLs), path and author URL validation, the payload builder, the caches, the coalescer (including a concurrent test), the batch pusher, the IMS helpers, the independent draft and published state logic and the ingest validator. The classes that use OSGi, Sling and JCR have no unit tests.
+- **Verified end to end** between a local AEM Cloud SDK author with a publisher (Sites side) and an RDE (Assets side), using the IMS technical account: publish, unpublish, delete, move, a template-structure asset and its cache refresh, an Assets outage recovered by the queue retry, a partial scan, percent-encoded and JSON-escaped URLs, a rejected page dropped without blocking, the JMX backfill, five quick publishes scanned once, and draft tracking (a draft edit appears, a text-only edit makes no push, publish and unpublish leave the other set alone, removing an image from a draft, delete, the ignored-users filter, and an idle sweeper that logs nothing).
+- **Not tested yet:** an Experience Fragment inside a template structure, the 24-hour token refresh (the 401 path is unit-tested only), a full AEM restart with a scheduled job pending, vanity references, and everything on a real AEM 6.5 / AMS author.

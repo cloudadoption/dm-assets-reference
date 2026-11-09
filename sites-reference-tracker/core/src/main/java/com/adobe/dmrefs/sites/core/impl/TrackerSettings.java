@@ -2,6 +2,7 @@ package com.adobe.dmrefs.sites.core.impl;
 
 import com.adobe.dmrefs.sites.core.extract.ReferenceExtractor;
 import com.adobe.dmrefs.sites.core.util.Hashes;
+import com.adobe.dmrefs.sites.core.util.Ims;
 import org.osgi.service.component.annotations.Activate;
 import org.osgi.service.component.annotations.Component;
 import org.osgi.service.component.annotations.Modified;
@@ -43,9 +44,71 @@ public class TrackerSettings {
         String endpoint_url() default "";
 
         @AttributeDefinition(name = "Bearer token", type = AttributeType.PASSWORD,
-                description = "IMS access token for a user in the Assets 'dm-reference-writers' group. "
-                        + "On 6.5 may be a CryptoSupport-protected value {...}; on Cloud use $[secret:...].")
+                description = "Only used when auth.mode=static (development). IMS access token for a user in the "
+                        + "Assets 'dm-reference-writers' group. On 6.5 may be a CryptoSupport-protected value {...}.")
         String bearer_token() default "";
+
+        @AttributeDefinition(name = "Auth mode",
+                description = "oauth: IMS client-credentials token, refreshed automatically (default). "
+                        + "static: the bearer.token above, for development only.")
+        String auth_mode() default "oauth";
+
+        @AttributeDefinition(name = "IMS token URL",
+                description = "Must be https on a known Adobe IMS host (checked in code).")
+        String ims_token_url() default "https://ims-na1.adobelogin.com/ims/token/v3";
+
+        @AttributeDefinition(name = "IMS client ID", description = "Technical account client ID.")
+        String ims_client_id() default "";
+
+        @AttributeDefinition(name = "IMS client secret", type = AttributeType.PASSWORD,
+                description = "Technical account client secret. On 6.5 may be CryptoSupport-protected {...}; "
+                        + "on Cloud use $[secret:...].")
+        String ims_client_secret() default "";
+
+        @AttributeDefinition(name = "IMS scopes")
+        String[] ims_scopes() default {"openid", "AdobeID", "read_organizations",
+            "additional_info.projectedProductContext", "read_pc.dma_aem_ams"};
+
+        @AttributeDefinition(name = "Job delay (seconds)",
+                description = "Wait this long after a publish event before reading the page and pushing. "
+                        + "Repeat publishes within the window are scanned once. 1 to 86400.")
+        int job_delay_seconds() default 10;
+
+        @AttributeDefinition(name = "Scan cache size", description = "Pages remembered as already delivered.")
+        int scan_cache_size() default 10000;
+
+        @AttributeDefinition(name = "Template cache size")
+        int template_cache_size() default 200;
+
+        @AttributeDefinition(name = "Template cache TTL (seconds)")
+        int template_cache_ttl_seconds() default 600;
+
+        @AttributeDefinition(name = "Backfill pause (ms)", description = "Pause between backfill chunks.")
+        int backfill_pause_ms() default 2000;
+
+        @AttributeDefinition(name = "Draft tracking enabled",
+                description = "Track page edits (best effort) so unpublished pages show the assets they use.")
+        boolean draft_enabled() default true;
+
+        @AttributeDefinition(name = "Draft quiet window (seconds)",
+                description = "A page is scanned once it has had no edits for this long.")
+        int draft_quiet_seconds() default 60;
+
+        @AttributeDefinition(name = "Draft max wait (seconds)",
+                description = "A page that keeps being edited is scanned anyway after this long.")
+        int draft_max_wait_seconds() default 300;
+
+        @AttributeDefinition(name = "Draft max entries",
+                description = "Pages waiting in memory. When full, the oldest tenth is scanned early.")
+        int draft_max_entries() default 10000;
+
+        @AttributeDefinition(name = "Draft ignored users",
+                description = "Edits by these users are ignored. Exact name, or a prefix ending in *.")
+        String[] draft_ignored_users() default {"replication-service"};
+
+        @AttributeDefinition(name = "Fingerprint cache size",
+                description = "Pages whose last delivered draft set is remembered, to skip unchanged ones.")
+        int fingerprint_cache_size() default 10000;
 
         @AttributeDefinition(name = "Allow plain HTTP", description = "Local development only.")
         boolean allow_insecure_http() default false;
@@ -81,8 +144,9 @@ public class TrackerSettings {
         @AttributeDefinition(name = "Max follow depth")
         int max_follow_depth() default 3;
 
-        @AttributeDefinition(name = "Max nodes scanned per page")
-        int max_nodes_per_page() default 5000;
+        @AttributeDefinition(name = "Max nodes scanned per page",
+                description = "A page that hits this limit is sent as partial: references are only added.")
+        int max_nodes_per_page() default 20000;
 
         @AttributeDefinition(name = "Push batch size", description = "Pages per POST.")
         int push_batch_size() default 100;
@@ -115,6 +179,9 @@ public class TrackerSettings {
         if (!INSTANCE_ID.matcher(cfg.instance_id()).matches()) {
             LOG.warn("DM References: instance.id is missing or invalid; pushes are disabled until it is set.");
         }
+        if (!isOauth()) {
+            LOG.warn("DM References: auth.mode=static is for development only; use oauth in production.");
+        }
         LOG.info("DM References: settings loaded: {}", describe());
     }
 
@@ -127,7 +194,8 @@ public class TrackerSettings {
         return "enabled=" + c.enabled() + ", instanceId=" + c.instance_id()
                 + ", endpointHost=" + (endpoint == null ? "none" : endpoint.getHost())
                 + ", authorUrl=" + (authorUrl == null ? "none" : authorUrl)
-                + ", tokenSet=" + !c.bearer_token().isEmpty()
+                + ", authMode=" + (isOauth() ? "oauth" : "static")
+                + ", credentialsSet=" + hasCredentials()
                 + ", contentRoots=" + Arrays.toString(contentRoots)
                 + ", uuidPatterns=" + c.uuid_patterns().length
                 + ", vanityPatterns=" + c.vanity_patterns().length;
@@ -173,7 +241,85 @@ public class TrackerSettings {
     /** True when everything needed to push is configured. */
     public boolean canPush() {
         return isEnabled() && endpoint != null && INSTANCE_ID.matcher(config.instance_id()).matches()
-                && !config.bearer_token().isEmpty();
+                && hasCredentials();
+    }
+
+    private boolean hasCredentials() {
+        Config c = config;
+        if (c == null) {
+            return false;
+        }
+        if (isOauth()) {
+            return !c.ims_client_id().isEmpty() && !c.ims_client_secret().isEmpty()
+                    && Ims.isAllowedTokenUrl(c.ims_token_url());
+        }
+        return !c.bearer_token().isEmpty();
+    }
+
+    public boolean isOauth() {
+        return config != null && !"static".equalsIgnoreCase(config.auth_mode());
+    }
+
+    public String imsTokenUrl() {
+        return config.ims_token_url();
+    }
+
+    public String imsClientId() {
+        return config.ims_client_id();
+    }
+
+    public String rawImsClientSecret() {
+        return config.ims_client_secret();
+    }
+
+    public String[] imsScopes() {
+        return config.ims_scopes();
+    }
+
+    /** Clamped to 1..86400 s. */
+    public int jobDelaySeconds() {
+        return Math.min(86400, Math.max(1, config.job_delay_seconds()));
+    }
+
+    public int scanCacheSize() {
+        return Math.max(10, config.scan_cache_size());
+    }
+
+    public int templateCacheSize() {
+        return Math.max(1, config.template_cache_size());
+    }
+
+    public long templateCacheTtlMs() {
+        return Math.max(1, config.template_cache_ttl_seconds()) * 1000L;
+    }
+
+    public int backfillPauseMs() {
+        return Math.max(0, config.backfill_pause_ms());
+    }
+
+    /** Draft tracking needs the same configuration as pushing. */
+    public boolean isDraftEnabled() {
+        return canPush() && config.draft_enabled();
+    }
+
+    public long draftQuietMs() {
+        return Math.max(1, config.draft_quiet_seconds()) * 1000L;
+    }
+
+    public long draftMaxWaitMs() {
+        return Math.max(config.draft_quiet_seconds(), config.draft_max_wait_seconds()) * 1000L;
+    }
+
+    public int draftMaxEntries() {
+        return Math.max(10, config.draft_max_entries());
+    }
+
+    public String[] draftIgnoredUsers() {
+        return config.draft_ignored_users();
+    }
+
+    public int fingerprintCacheSize() {
+        return Math.max(10, config.fingerprint_cache_size());
     }
 
     public String instanceId() {

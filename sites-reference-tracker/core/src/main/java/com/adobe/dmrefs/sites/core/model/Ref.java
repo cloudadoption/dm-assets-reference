@@ -29,26 +29,9 @@ public final class Ref implements Comparable<Ref> {
         return value;
     }
 
-    /** Wire/storage form used in the /var snapshot: {@code uuid|urn:aaid:aem:...} or {@code vanity|summer-hero}. */
+    /** Stable text form, used for fingerprints: {@code uuid|urn:aaid:aem:...} or {@code vanity|summer-hero}. */
     public String encode() {
         return type.name().toLowerCase(Locale.ROOT) + SEP + value;
-    }
-
-    /** @return the decoded ref, or {@code null} if the stored value is malformed. */
-    public static Ref decode(String encoded) {
-        if (encoded == null) {
-            return null;
-        }
-        int i = encoded.indexOf(SEP);
-        if (i <= 0 || i == encoded.length() - 1) {
-            return null;
-        }
-        String t = encoded.substring(0, i).toUpperCase(Locale.ROOT);
-        try {
-            return new Ref(Type.valueOf(t), encoded.substring(i + 1));
-        } catch (IllegalArgumentException e) {
-            return null;
-        }
     }
 
     @Override

@@ -1,0 +1,9 @@
+{
+  "queue.name": "dmrefs-draft",
+  "queue.topics": ["com/adobe/dmrefs/draft"],
+  "queue.type": "ORDERED",
+  "queue.maxparallel": 1,
+  "queue.retries": 5,
+  "queue.retrydelay": 300000,
+  "queue.priority": "MIN"
+}

@@ -35,11 +35,16 @@ import java.util.TreeSet;
  *   unresolved/&lt;v0v1&gt;/&lt;sha256(vanity)&gt;/&lt;instanceId&gt;/&lt;sha256(pagePath)&gt;
  *       instanceId, pagePath, vanity, author, published, updatedAt
  *   pages/&lt;instanceId&gt;/&lt;p0p1&gt;/&lt;sha256(pagePath)&gt;
- *       instanceId, pagePath, seq, deleted, keys[] (relative paths of the entries above), updatedAt
+ *       instanceId, pagePath, seq, authorSeq, publishedSeq, deleted, keys[] (relative paths of the entries above), updatedAt
  * </pre>
  *
  * Writes for a page replace that page's previous entries (computed from the page index), so the store
- * converges regardless of how many times a page is re-sent. Callers own the resolver and must commit.
+ * converges regardless of how many times a page is re-sent. The draft (author) and published sets are
+ * independent: a set that is absent from an update is left unchanged, and each has its own seq. An entry is
+ * deleted only when both of its flags are false. A partial page only adds: nothing is deleted and
+ * flags are never cleared. A page the store has never seen, sent with no references, writes nothing.
+ * Nodes are oak:Unstructured because popular assets collect very large child lists, which are slow on
+ * orderable node types. Callers own the resolver and must commit.
  */
 @Component(service = ReferenceStore.class)
 public class ReferenceStore {
@@ -87,45 +92,76 @@ public class ReferenceStore {
         String indexPath = ROOT + "/pages/" + instanceId + "/" + pageHash.substring(0, 2) + "/" + pageHash;
         Resource index = rr.getResource(indexPath);
         Set<String> oldKeys = new HashSet<>();
+        long storedAuthorSeq = 0L;
+        long storedPublishedSeq = 0L;
         if (index != null) {
             ValueMap ivm = index.getValueMap();
-            if (ivm.get("seq", 0L) >= page.seq) {
-                return new Applied(Outcome.STALE, 0);
-            }
+            long legacySeq = ivm.get("seq", 0L);
+            storedAuthorSeq = ivm.get("authorSeq", legacySeq);
+            storedPublishedSeq = ivm.get("publishedSeq", legacySeq);
             oldKeys.addAll(Arrays.asList(ivm.get("keys", new String[0])));
+        }
+        boolean doAuthor = touchesAuthor(page) && page.seq > storedAuthorSeq;
+        boolean doPublished = touchesPublished(page) && page.seq > storedPublishedSeq;
+        if (!doAuthor && !doPublished) {
+            return new Applied(Outcome.STALE, 0);
+        }
+        if (isNoOp(index != null, page)) {
+            return new Applied(Outcome.APPLIED, 0);
         }
 
         Session session = rr.adaptTo(Session.class);
         Map<String, Pending> next = new LinkedHashMap<>();
         int unresolved = 0;
-        unresolved += collect(page.author, true, instanceId, page.pagePath, pageHash, session, vanityCache, next);
-        unresolved += collect(page.published, false, instanceId, page.pagePath, pageHash, session, vanityCache, next);
+        if (doAuthor) {
+            unresolved += collect(page.author, true, instanceId, page.pagePath, pageHash, session, vanityCache, next);
+        }
+        if (doPublished) {
+            unresolved += collect(page.published, false, instanceId, page.pagePath, pageHash, session, vanityCache, next);
+        }
 
         Calendar now = Calendar.getInstance();
-        for (String key : oldKeys) {
-            if (!next.containsKey(key)) {
-                deleteAndPrune(rr, ROOT + "/" + key);
+        Set<String> keep = new TreeSet<>();
+        Set<String> all = new TreeSet<>(oldKeys);
+        all.addAll(next.keySet());
+        for (String key : all) {
+            Pending p = next.get(key);
+            Resource existing = rr.getResource(ROOT + "/" + key);
+            ValueMap ev = existing == null ? null : existing.getValueMap();
+            boolean[] f = resolveFlags(doAuthor, doPublished, page.partial,
+                    ev != null && ev.get("author", false), ev != null && ev.get("published", false),
+                    p != null && p.author, p != null && p.published);
+            if (!f[0] && !f[1]) {
+                if (existing != null) {
+                    deleteAndPrune(rr, ROOT + "/" + key);
+                }
+                continue;
             }
-        }
-        for (Map.Entry<String, Pending> e : next.entrySet()) {
-            Pending p = e.getValue();
-            Resource r = ensure(rr, ROOT + "/" + e.getKey());
+            keep.add(key);
+            Resource r = existing != null ? existing : ensure(rr, ROOT + "/" + key);
             ModifiableValueMap mvm = r.adaptTo(ModifiableValueMap.class);
             if (mvm == null) {
                 throw new PersistenceException("Not modifiable: " + r.getPath());
             }
-            mvm.putAll(p.props);
+            if (p != null) {
+                mvm.putAll(p.props);
+                Set<String> referencedAs = new TreeSet<>(p.referencedAs);
+                boolean otherStateKeepsIt = (!doAuthor && f[0]) || (!doPublished && f[1]);
+                if (ev != null && (page.partial || otherStateKeepsIt)) {
+                    referencedAs.addAll(Arrays.asList(ev.get("referencedAs", new String[0])));
+                }
+                if (!referencedAs.isEmpty()) {
+                    mvm.put("referencedAs", referencedAs.toArray(new String[0]));
+                }
+            }
             if (authorUrl != null) {
                 mvm.put("authorUrl", authorUrl);
             } else {
                 mvm.remove("authorUrl");
             }
-            mvm.put("author", p.author);
-            mvm.put("published", p.published);
+            mvm.put("author", f[0]);
+            mvm.put("published", f[1]);
             mvm.put("updatedAt", now);
-            if (!p.referencedAs.isEmpty()) {
-                mvm.put("referencedAs", p.referencedAs.toArray(new String[0]));
-            }
         }
 
         Resource idx = ensure(rr, indexPath);
@@ -133,13 +169,45 @@ public class ReferenceStore {
         if (ivm == null) {
             throw new PersistenceException("Not modifiable: " + indexPath);
         }
+        long authorSeq = doAuthor ? page.seq : storedAuthorSeq;
+        long publishedSeq = doPublished ? page.seq : storedPublishedSeq;
         ivm.put("instanceId", instanceId);
         ivm.put("pagePath", page.pagePath);
-        ivm.put("seq", page.seq);
+        ivm.put("authorSeq", authorSeq);
+        ivm.put("publishedSeq", publishedSeq);
+        ivm.put("seq", Math.max(authorSeq, publishedSeq));
         ivm.put("deleted", page.deleted);
-        ivm.put("keys", next.keySet().toArray(new String[0]));
+        ivm.put("keys", keep.toArray(new String[0]));
         ivm.put("updatedAt", now);
         return new Applied(Outcome.APPLIED, unresolved);
+    }
+
+    /** Never-seen page with nothing to record: skip, so every unpublish of an untracked page leaves no node. */
+    public static boolean isNoOp(boolean indexExists, ValidPage page) {
+        return !indexExists && page.author.isEmpty() && page.published.isEmpty();
+    }
+
+    /** The update replaces the draft set (a deleted page clears both sets). */
+    public static boolean touchesAuthor(ValidPage page) {
+        return page.deleted || page.authorPresent;
+    }
+
+    /** The update replaces the published set (a deleted page clears both sets). */
+    public static boolean touchesPublished(ValidPage page) {
+        return page.deleted || page.publishedPresent;
+    }
+
+    /**
+     * New {author, published} flags of one entry. A state that is not being updated keeps its flag; an updated
+     * state takes the new set, or only gains flags when the scan was partial. The entry is deleted when both are false.
+     */
+    public static boolean[] resolveFlags(boolean updateAuthor, boolean updatePublished, boolean partial,
+                                         boolean existingAuthor, boolean existingPublished,
+                                         boolean inAuthor, boolean inPublished) {
+        boolean author = updateAuthor ? (partial ? existingAuthor || inAuthor : inAuthor) : existingAuthor;
+        boolean published = updatePublished ? (partial ? existingPublished || inPublished : inPublished)
+                : existingPublished;
+        return new boolean[] {author, published};
     }
 
     private int collect(Set<ValidRef> refs, boolean isAuthor, String instanceId, String pagePath, String pageHash,
@@ -247,7 +315,7 @@ public class ReferenceStore {
         int idx = path.lastIndexOf('/');
         Resource parent = ensure(rr, path.substring(0, idx));
         Map<String, Object> props = new HashMap<>();
-        props.put("jcr:primaryType", "nt:unstructured");
+        props.put("jcr:primaryType", "oak:Unstructured");
         return rr.create(parent, path.substring(idx + 1), props);
     }
 }

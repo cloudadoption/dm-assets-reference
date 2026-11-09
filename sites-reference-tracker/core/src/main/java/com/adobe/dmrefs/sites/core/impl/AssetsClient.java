@@ -1,7 +1,7 @@
 package com.adobe.dmrefs.sites.core.impl;
 
-import com.adobe.granite.crypto.CryptoException;
-import com.adobe.granite.crypto.CryptoSupport;
+import com.adobe.dmrefs.sites.core.model.PageUpdate;
+import com.adobe.dmrefs.sites.core.util.BatchPusher;
 import org.apache.http.HttpResponse;
 import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.methods.HttpPost;
@@ -12,12 +12,11 @@ import org.apache.http.osgi.services.HttpClientBuilderFactory;
 import org.apache.http.util.EntityUtils;
 import org.osgi.service.component.annotations.Component;
 import org.osgi.service.component.annotations.Reference;
-import org.osgi.service.component.annotations.ReferenceCardinality;
-import org.osgi.service.component.annotations.ReferencePolicyOption;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.List;
 
 /** Sends ingest batches to the Assets receiver. Never logs the token or the payload. */
 @Component(service = AssetsClient.class)
@@ -31,11 +30,46 @@ public class AssetsClient {
     @Reference
     private TrackerSettings settings;
 
-    @Reference(cardinality = ReferenceCardinality.OPTIONAL, policyOption = ReferencePolicyOption.GREEDY)
-    private volatile CryptoSupport cryptoSupport;
+    @Reference
+    private TokenProvider tokens;
 
-    /** @return HTTP status code, or -1 on transport error. */
-    public int post(String json) {
+    /**
+     * Sends the pages, resending one by one if Assets rejects the batch, so one bad page is dropped and the rest
+     * delivered. See {@link BatchPusher}.
+     */
+    public BatchPusher.Result push(List<PageUpdate> pages) {
+        return BatchPusher.push(pages, new BatchPusher.Sender() {
+            @Override
+            public int send(List<PageUpdate> batch) {
+                return post(PushPayload.build(settings.instanceId(), settings.authorUrl(), batch));
+            }
+        });
+    }
+
+    /**
+     * On a 401 or 403 in oauth mode the token is refreshed and the request is sent once more.
+     *
+     * @return HTTP status code, or -1 on a transport or token error.
+     */
+    private int post(String json) {
+        for (int attempt = 0; attempt < 2; attempt++) {
+            String token;
+            try {
+                token = tokens.token();
+            } catch (IOException e) {
+                return -1;
+            }
+            int status = send(json, token);
+            if ((status == 401 || status == 403) && attempt == 0 && tokens.isOauth()) {
+                tokens.invalidate();
+                continue;
+            }
+            return status;
+        }
+        return -1;
+    }
+
+    private int send(String json, String token) {
         RequestConfig rc = RequestConfig.custom()
                 .setConnectTimeout(settings.connectTimeoutMs())
                 .setConnectionRequestTimeout(settings.connectTimeoutMs())
@@ -44,7 +78,7 @@ public class AssetsClient {
                 .build();
         HttpPost post = new HttpPost(settings.endpoint());
         post.setConfig(rc);
-        post.setHeader("Authorization", "Bearer " + token());
+        post.setHeader("Authorization", "Bearer " + token);
         post.setHeader("Accept", "application/json");
         post.setEntity(new StringEntity(json, ContentType.APPLICATION_JSON));
 
@@ -62,19 +96,5 @@ public class AssetsClient {
             LOG.warn("DM References: push to {} failed: {}", settings.endpoint().getHost(), e.getClass().getSimpleName());
             return -1;
         }
-    }
-
-    private String token() {
-        String raw = settings.rawBearerToken();
-        CryptoSupport cs = cryptoSupport;
-        if (cs != null && cs.isProtected(raw)) {
-            try {
-                return cs.unprotect(raw);
-            } catch (CryptoException e) {
-                LOG.error("DM References: could not decrypt bearer.token; check the instance crypto keys.");
-                return "";
-            }
-        }
-        return raw;
     }
 }

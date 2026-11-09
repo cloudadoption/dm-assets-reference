@@ -2,6 +2,8 @@ package com.adobe.dmrefs.sites.core.extract;
 
 import com.adobe.dmrefs.sites.core.model.Ref;
 
+import java.io.UnsupportedEncodingException;
+import java.net.URLDecoder;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -52,12 +54,34 @@ public final class ReferenceExtractor {
         return Collections.unmodifiableList(out);
     }
 
-    /** Adds every reference found in {@code text} to {@code out}. */
+    /** Adds every reference found in {@code text} to {@code out}, also matching its unescaped / URL-decoded form. */
     public void extract(String text, Set<Ref> out) {
         if (text == null || text.isEmpty()) {
             return;
         }
         String s = text.length() > MAX_SCAN_CHARS ? text.substring(0, MAX_SCAN_CHARS) : text;
+        match(s, out);
+        String n = normalise(s);
+        if (!n.equals(s)) {
+            match(n, out);
+        }
+    }
+
+    /** Turns JSON-escaped slashes and percent-encoding (e.g. urn%3Aaaid%3Aaem%3A...) back into plain text. */
+    static String normalise(String s) {
+        String r = s.indexOf("\\/") >= 0 ? s.replace("\\/", "/") : s;
+        if (r.indexOf('%') >= 0) {
+            try {
+                // A literal '+' must stay a '+', not become a space.
+                r = URLDecoder.decode(r.replace("+", "%2B"), "UTF-8");
+            } catch (UnsupportedEncodingException | IllegalArgumentException e) {
+                // keep the text as it was
+            }
+        }
+        return r;
+    }
+
+    private void match(String s, Set<Ref> out) {
         for (Pattern p : uuidPatterns) {
             Matcher m = p.matcher(s);
             while (m.find()) {
@@ -79,9 +103,5 @@ public final class ReferenceExtractor {
                 }
             }
         }
-    }
-
-    public boolean hasPatterns() {
-        return !uuidPatterns.isEmpty() || !vanityPatterns.isEmpty();
     }
 }

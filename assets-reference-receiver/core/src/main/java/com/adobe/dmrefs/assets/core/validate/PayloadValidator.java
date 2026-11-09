@@ -55,13 +55,22 @@ public final class PayloadValidator {
         public final String pagePath;
         public final long seq;
         public final boolean deleted;
+        /** The sender's scan was cut short: add references, never remove any. */
+        public final boolean partial;
+        /** The set was sent (even if empty): it replaces the stored one. An absent set is left unchanged. */
+        public final boolean authorPresent;
+        public final boolean publishedPresent;
         public final Set<ValidRef> author;
         public final Set<ValidRef> published;
 
-        ValidPage(String pagePath, long seq, boolean deleted, Set<ValidRef> author, Set<ValidRef> published) {
+        ValidPage(String pagePath, long seq, boolean deleted, boolean partial, boolean authorPresent,
+                  boolean publishedPresent, Set<ValidRef> author, Set<ValidRef> published) {
             this.pagePath = pagePath;
             this.seq = seq;
             this.deleted = deleted;
+            this.partial = partial;
+            this.authorPresent = authorPresent;
+            this.publishedPresent = publishedPresent;
             this.author = Collections.unmodifiableSet(author);
             this.published = Collections.unmodifiableSet(published);
         }
@@ -136,6 +145,15 @@ public final class PayloadValidator {
             errors.add(at + ".seq: must be a positive integer");
         }
         boolean deleted = Boolean.TRUE.equals(p.deleted);
+        boolean partial = Boolean.TRUE.equals(p.partial);
+        if (deleted && partial) {
+            errors.add(at + ": deleted pages cannot be partial");
+        }
+        boolean authorPresent = p.author != null;
+        boolean publishedPresent = p.published != null;
+        if (!deleted && !authorPresent && !publishedPresent) {
+            errors.add(at + ": author, published or deleted required");
+        }
         Set<ValidRef> author = refs(p.author, at + ".author", errors);
         Set<ValidRef> published = refs(p.published, at + ".published", errors);
         if (deleted && (!author.isEmpty() || !published.isEmpty())) {
@@ -144,7 +162,7 @@ public final class PayloadValidator {
         if (errors.size() != before) {
             return null;
         }
-        return new ValidPage(p.pagePath, p.seq, deleted, author, published);
+        return new ValidPage(p.pagePath, p.seq, deleted, partial, authorPresent, publishedPresent, author, published);
     }
 
     private Set<ValidRef> refs(List<RefDto> in, String at, List<String> errors) {

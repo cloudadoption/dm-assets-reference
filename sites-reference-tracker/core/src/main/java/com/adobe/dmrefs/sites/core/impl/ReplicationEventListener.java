@@ -11,9 +11,12 @@ import org.osgi.service.event.EventHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
+import java.util.List;
+
 /**
- * Publish / unpublish on author -> page jobs. Fires when replication is triggered (not when delivered);
- * the reconcile task corrects drift using the page's replication status.
+ * Publish / unpublish / delete on author -> delayed publish jobs. Fires when replication is requested, not when
+ * delivered. The event only says which paths changed; the job reads the page's current replication status.
  */
 @Component(service = EventHandler.class,
         property = EventConstants.EVENT_TOPIC + "=" + ReplicationAction.EVENT_TOPIC)
@@ -32,8 +35,8 @@ public class ReplicationEventListener implements EventHandler {
 
     @Override
     public void handleEvent(Event event) {
-        if (!settings.isEnabled() || event.getProperty(EVENT_APPLICATION) != null) {
-            LOG.debug("DM References: replication event ignored; tracker disabled or event from another node.");
+        if (!settings.canPush() || event.getProperty(EVENT_APPLICATION) != null) {
+            LOG.debug("DM References: replication event ignored; tracker not ready or event from another node.");
             return;
         }
         ReplicationAction action = ReplicationAction.fromEvent(event);
@@ -41,15 +44,10 @@ public class ReplicationEventListener implements EventHandler {
             LOG.debug("DM References: replication event ignored; no replication action or type.");
             return;
         }
-        LOG.debug("DM References: replication event {} for {}", action.getType(), action.getPath());
-        Jobs.Action jobAction;
         switch (action.getType()) {
             case ACTIVATE:
-                jobAction = Jobs.Action.PUBLISHED;
-                break;
             case DEACTIVATE:
             case DELETE:
-                jobAction = Jobs.Action.UNPUBLISHED;
                 break;
             default:
                 LOG.debug("DM References: replication type {} not tracked.", action.getType());
@@ -60,13 +58,18 @@ public class ReplicationEventListener implements EventHandler {
         if (paths == null) {
             paths = new String[] {action.getPath()};
         }
+        List<String> valid = new ArrayList<>();
         for (String p : paths) {
             // Non-page paths (assets, XFs under other roots) are filtered here or ignored by the consumer.
             if (Hashes.isValidContentPath(p) && Hashes.isUnderAnyRoot(p, roots)) {
-                Jobs.enqueue(jobManager, p, jobAction);
-            } else {
-                LOG.debug("DM References: skipped {} for {}; invalid path or outside content roots.", jobAction, p);
+                valid.add(p);
             }
         }
+        int chunk = settings.pushBatchSize();
+        for (int i = 0; i < valid.size(); i += chunk) {
+            List<String> part = valid.subList(i, Math.min(valid.size(), i + chunk));
+            Jobs.enqueuePublish(jobManager, part.toArray(new String[0]), settings.jobDelaySeconds());
+        }
+        LOG.debug("DM References: replication {} -> {} path(s) queued", action.getType(), valid.size());
     }
 }

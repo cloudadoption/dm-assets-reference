@@ -18,6 +18,7 @@ public class IngestRequest {
         public String pagePath;
         public Long seq;
         public Boolean deleted;
+        public Boolean partial;
         public List<RefDto> author;
         public List<RefDto> published;
     }

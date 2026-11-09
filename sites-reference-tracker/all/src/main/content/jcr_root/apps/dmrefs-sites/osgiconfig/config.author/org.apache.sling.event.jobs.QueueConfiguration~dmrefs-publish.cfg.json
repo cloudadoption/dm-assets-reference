@@ -1,0 +1,9 @@
+{
+  "queue.name": "dmrefs-publish",
+  "queue.topics": ["com/adobe/dmrefs/publish"],
+  "queue.type": "ORDERED",
+  "queue.maxparallel": 1,
+  "queue.retries": 288,
+  "queue.retrydelay": 300000,
+  "queue.priority": "MIN"
+}

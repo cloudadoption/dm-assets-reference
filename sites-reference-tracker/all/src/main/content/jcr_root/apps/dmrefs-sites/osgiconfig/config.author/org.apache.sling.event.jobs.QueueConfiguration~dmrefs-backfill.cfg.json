@@ -1,0 +1,8 @@
+{
+  "queue.name": "dmrefs-backfill",
+  "queue.topics": ["com/adobe/dmrefs/backfill"],
+  "queue.type": "ORDERED",
+  "queue.maxparallel": 1,
+  "queue.retries": 0,
+  "queue.priority": "MIN"
+}
